@@ -1,0 +1,1271 @@
+"""
+Core functionality for ClaudeControl
+Give Claude control of your terminal with elegant simplicity
+"""
+
+import os
+import json
+import time
+import atexit
+import logging
+import tempfile
+import threading
+import signal
+import fcntl
+import re
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Optional, Union, List, Dict, Any, Callable
+from contextlib import contextmanager
+from collections import deque
+
+import pexpect
+import psutil
+
+from .exceptions import SessionError, TimeoutError, ProcessError, ConfigNotFoundError
+from .patterns import COMMON_PROMPTS, COMMON_ERRORS
+
+# Import replay components
+from .replay.modes import RecordMode, FallbackMode
+from .replay.store import TapeStore
+from .replay.record import Recorder, ChunkSink
+from .replay.play import ReplayTransport, LiveTransport
+from .replay.namegen import DefaultTapeNameGenerator
+from .replay.matchers import create_matcher_set
+from .replay.decorators import DecoratorSet
+from .replay.latency import LatencyPolicy
+from .replay.errors import ErrorInjectionPolicy
+from .replay.summary import print_summary
+
+# Global session registry for persistence across calls
+_sessions: Dict[str, 'Session'] = {}
+_lock = threading.Lock()
+_config = None
+_config_lock = threading.Lock()
+
+logger = logging.getLogger(__name__)
+
+# Compile error patterns for pipe streaming
+ERROR_PATTERNS = re.compile('|'.join(
+    pattern for patterns in COMMON_ERRORS.values() 
+    for pattern in patterns
+), re.IGNORECASE)
+
+
+def _load_config() -> dict:
+    """Load configuration with smart defaults"""
+    global _config
+    if _config is None:
+        with _config_lock:
+            if _config is None:
+                config_path = Path.home() / ".claude-control" / "config.json"
+                if config_path.exists():
+                    try:
+                        _config = json.loads(config_path.read_text())
+                    except Exception:
+                        _config = {}
+                else:
+                    _config = {}
+
+                # Apply defaults
+                _config.setdefault("session_timeout", 300)
+                _config.setdefault("max_sessions", 20)
+                _config.setdefault("auto_cleanup", True)
+                _config.setdefault("log_level", "INFO")
+                _config.setdefault("output_limit", 10000)
+
+    return _config
+
+
+class Session:
+    """
+    A smart controlled session with automatic management
+    """
+    
+    def __init__(
+        self,
+        command: str,
+        timeout: int = 30,
+        cwd: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
+        encoding: str = "utf-8",
+        dimensions: tuple = (24, 80),
+        session_id: Optional[str] = None,
+        persist: bool = True,
+        stream: bool = False,
+        # Record/Replay parameters
+        tapes_path: str = "./tapes",
+        record: RecordMode = RecordMode.DISABLED,
+        fallback: FallbackMode = FallbackMode.NOT_FOUND,
+        tape_name_generator: Optional[Any] = None,
+        # Matching parameters
+        allow_env: Optional[List[str]] = None,
+        ignore_env: Optional[List[str]] = None,
+        ignore_args: Optional[List[Union[int, str]]] = None,
+        ignore_stdin: bool = False,
+        stdin_matcher: Optional[Callable] = None,
+        command_matcher: Optional[Callable] = None,
+        # Decorators
+        input_decorator: Optional[Callable] = None,
+        output_decorator: Optional[Callable] = None,
+        tape_decorator: Optional[Callable] = None,
+        # Simulation
+        latency: Union[int, tuple, Callable] = 0,
+        error_rate: Union[float, Callable] = 0,
+        # Logging
+        summary: bool = True,
+        silent: bool = False,
+        debug: bool = False,
+    ):
+        self.session_id = session_id or f"session_{int(time.time() * 1000)}"
+        self.command = command
+        self.args = []  # Will be extracted from command if needed
+        self.timeout = timeout
+        self.created_at = datetime.now()
+        self.last_activity = datetime.now()
+        self.persist = persist
+        self.encoding = encoding
+        self.cwd = cwd or os.getcwd()
+        self.env = env or os.environ.copy()
+
+        # Output management with rotation
+        config = _load_config()
+        self.output_buffer = deque(maxlen=config["output_limit"])
+        # Use deque with maxlen for full_output to prevent unbounded growth
+        self.full_output = deque(maxlen=config.get("full_output_limit", 50000))
+
+        # Record/Replay setup
+        self.tapes_path = Path(tapes_path)
+        self.record_mode = record
+        self.fallback_mode = fallback
+        self.summary_enabled = summary
+        self.silent = silent
+        self.debug = debug
+
+        # Initialize replay components
+        self._transport = None
+        self._recorder = None
+        self._store = None
+        self._use_replay = record == RecordMode.DISABLED and fallback == FallbackMode.NOT_FOUND
+
+        # Setup tape name generator
+        if tape_name_generator is None:
+            tape_name_generator = DefaultTapeNameGenerator(self.tapes_path)
+        self.tape_name_generator = tape_name_generator
+
+        # Setup matchers
+        self._matcher_set = create_matcher_set(
+            allow_env=allow_env,
+            ignore_env=ignore_env,
+            ignore_args=ignore_args,
+            ignore_stdin=ignore_stdin,
+            stdin_matcher=stdin_matcher,
+            command_matcher=command_matcher
+        )
+
+        # Setup decorators
+        self._decorators = DecoratorSet(
+            input_decorator=input_decorator,
+            output_decorator=output_decorator,
+            tape_decorator=tape_decorator
+        )
+
+        # Setup policies
+        self._latency_policy = LatencyPolicy(global_latency=latency) if latency else None
+        self._error_policy = ErrorInjectionPolicy(error_rate=error_rate) if error_rate else None
+
+        # Track expect/response history for configuration generation
+        self.expect_history: List[Dict[str, Any]] = []
+        
+        # Add resource management
+        self.start_time = time.time()
+        self.max_runtime = config.get("max_session_runtime", 3600)  # 1 hour default
+        self.max_output_size = config.get("max_output_size", 100 * 1024 * 1024)  # 100MB
+        
+        # Check total sessions
+        if len(_sessions) >= config.get("max_sessions", 20):
+            raise SessionError("Maximum number of sessions reached")
+        
+        # Set up streaming if requested
+        self._pipe_path = None
+        self.pipe_fd = None
+        if stream:
+            self._setup_pipe_stream()
+
+        # Decide whether to use replay or live process
+        self._determine_and_setup_transport(command, timeout, cwd, env, encoding, dimensions)
+
+        # Initialize compatibility attributes
+        self.before = None
+        self.after = None
+        self.match = None
+
+        # Register for cleanup
+        if persist:
+            with _lock:
+                _sessions[self.session_id] = self
+    
+    class _OutputCapture:
+        """Capture output to both buffer and file"""
+        def __init__(self, session):
+            self.session = session
+
+        def write(self, data):
+            if data:
+                self.session._capture_output(data)
+
+        def flush(self):
+            pass
+
+    class _CompositeLogfile:
+        """Composite logfile that writes to multiple handlers"""
+        def __init__(self, *handlers):
+            self.handlers = list(handlers)
+
+        def write(self, data):
+            for handler in self.handlers:
+                if handler and hasattr(handler, 'write'):
+                    handler.write(data)
+
+        def flush(self):
+            for handler in self.handlers:
+                if handler and hasattr(handler, 'flush'):
+                    handler.flush()
+
+        def add_handler(self, handler):
+            if handler and handler not in self.handlers:
+                self.handlers.append(handler)
+    
+    def _capture_output(self, data: Union[str, bytes]):
+        """Capture output with automatic rotation"""
+        self.last_activity = datetime.now()
+
+        # Convert bytes to string if needed
+        if isinstance(data, bytes):
+            data = data.decode(self.encoding or 'utf-8', errors='replace')
+
+        # Add to buffers
+        lines = data.splitlines(keepends=True)
+        for line in lines:
+            self.output_buffer.append(line)
+            self.full_output.append(line)  # Now limited by deque maxlen
+
+            # Write to pipe if streaming
+            if self.pipe_fd is not None:
+                # Check if line matches error patterns
+                event_type = "ERR" if ERROR_PATTERNS.search(line.rstrip()) else "OUT"
+                self._write_pipe_event(event_type, line.rstrip())
+            
+        # Write to session log
+        log_dir = Path.home() / ".claude-control" / "sessions" / self.session_id
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        log_file = log_dir / "output.log"
+        with open(log_file, "a", encoding=self.encoding) as f:
+            f.write(data)
+            
+        # Rotate if needed (> 10MB)
+        if log_file.stat().st_size > 10 * 1024 * 1024:
+            rotated = log_dir / f"output_{int(time.time())}.log"
+            log_file.rename(rotated)
+    
+    def send(self, text: Union[str, bytes], delay: float = 0) -> None:
+        """Send input to the process"""
+        if not self.is_alive():
+            raise SessionError(f"Session {self.session_id} is not active")
+
+        # Write to pipe if streaming
+        if self.pipe_fd is not None:
+            pipe_text = text if isinstance(text, str) else text.decode(self.encoding or 'utf-8', errors='replace')
+            self._write_pipe_event("IN ", pipe_text)
+
+        # Convert to bytes
+        if isinstance(text, str):
+            data = text.encode(self.encoding) if self.encoding else text.encode()
+        else:
+            data = text
+
+        # Notify recorder if active
+        if self._recorder:
+            self._recorder.on_send(data, "raw")
+
+        # Send via transport
+        if delay:
+            # Handle delay for both string and bytes
+            if isinstance(text, str):
+                for char in text:
+                    self._transport.send(char.encode(self.encoding or 'utf-8'))
+                    time.sleep(delay)
+            else:
+                # For bytes, send byte by byte
+                for byte in data:
+                    self._transport.send(bytes([byte]))
+                    time.sleep(delay)
+        else:
+            self._transport.send(data)
+
+        self.last_activity = datetime.now()
+    
+    def sendline(self, line: str = "") -> None:
+        """Send a line to the process"""
+        if not self.is_alive():
+            raise SessionError(f"Session {self.session_id} is not active")
+
+        # Write to pipe if streaming
+        if self.pipe_fd is not None:
+            self._write_pipe_event("IN ", line)
+
+        # Notify recorder if active
+        if self._recorder:
+            data = (line + "\n").encode(self.encoding) if self.encoding else (line + "\n").encode()
+            self._recorder.on_send(data, "line")
+
+        # Send via transport
+        self._transport.sendline(line)
+        self.last_activity = datetime.now()
+    
+    def expect(
+        self,
+        patterns: Union[str, List[str]],
+        timeout: Optional[int] = None,
+        searchwindowsize: Optional[int] = None,
+    ) -> int:
+        """
+        Wait for patterns with better error handling
+        Returns index of matched pattern
+        """
+        if isinstance(patterns, str):
+            patterns = [patterns]
+            
+        timeout = timeout or self.timeout
+        
+        try:
+            index = self._transport.expect(
+                patterns,
+                timeout=timeout,
+            )
+            self.last_activity = datetime.now()
+            self._record_expectation("expect", patterns, index)
+
+            # Update session attributes for compatibility
+            if hasattr(self._transport, 'before'):
+                self.before = self._transport.before
+            if hasattr(self._transport, 'after'):
+                self.after = self._transport.after
+            if hasattr(self._transport, 'match'):
+                self.match = self._transport.match
+
+            # Notify recorder if active
+            if self._recorder:
+                exit_info = None
+                if not self.is_alive():
+                    exit_info = {
+                        'code': self._transport.exitstatus,
+                        'signal': self._transport.signalstatus
+                    }
+                self._recorder.on_expect_complete(patterns, index, exit_info)
+
+            return index
+
+        except TimeoutError:
+            # Include recent output in error for debugging
+            recent = self.get_recent_output(50)
+            raise TimeoutError(
+                f"Timeout waiting for patterns {patterns}\n"
+                f"Recent output:\n{recent}"
+            )
+        except pexpect.EOF:
+            raise ProcessError(f"Process ended unexpectedly")
+
+    def expect_exact(
+        self,
+        patterns: Union[str, List[str]],
+        timeout: Optional[int] = None,
+    ) -> int:
+        """Expect exact strings (no regex)"""
+        if isinstance(patterns, str):
+            patterns = [patterns]
+            
+        timeout = timeout or self.timeout
+        
+        try:
+            index = self._transport.expect_exact(patterns, timeout=timeout)
+            self.last_activity = datetime.now()
+            self._record_expectation("expect_exact", patterns, index)
+
+            # Update session attributes for compatibility
+            if hasattr(self._transport, 'before'):
+                self.before = self._transport.before
+            if hasattr(self._transport, 'after'):
+                self.after = self._transport.after
+            if hasattr(self._transport, 'match'):
+                self.match = self._transport.match
+
+            # Notify recorder if active
+            if self._recorder:
+                exit_info = None
+                if not self.is_alive():
+                    exit_info = {
+                        'code': self._transport.exitstatus,
+                        'signal': self._transport.signalstatus
+                    }
+                self._recorder.on_expect_complete(patterns, index, exit_info)
+
+            return index
+        except TimeoutError:
+            recent = self.get_recent_output(50)
+            raise TimeoutError(
+                f"Timeout waiting for exact patterns {patterns}\n"
+                f"Recent output:\n{recent}"
+            )
+
+    def _record_expectation(self, expect_type: str, patterns: List[Any], matched_index: int) -> None:
+        """Store successful expect calls for later analysis"""
+        pattern_list = list(patterns) if isinstance(patterns, (list, tuple)) else [patterns]
+        normalized_patterns = [self._pattern_to_str(pattern) for pattern in pattern_list]
+
+        matched_pattern = None
+        if 0 <= matched_index < len(normalized_patterns):
+            matched_pattern = normalized_patterns[matched_index]
+
+        history_entry: Dict[str, Any] = {
+            "timestamp": datetime.now().isoformat(),
+            "type": expect_type,
+            "patterns": normalized_patterns,
+            "matched_index": matched_index,
+            "matched_pattern": matched_pattern,
+        }
+
+        if hasattr(self, "before"):
+            history_entry["before"] = self.before
+        if hasattr(self, "after"):
+            history_entry["after"] = self.after
+
+        self.expect_history.append(history_entry)
+
+    @staticmethod
+    def _pattern_to_str(pattern: Any) -> str:
+        """Convert pattern or regex to a readable string"""
+        if pattern is None:
+            return ""
+
+        if isinstance(pattern, str):
+            return pattern
+
+        if hasattr(pattern, "pattern"):
+            return pattern.pattern
+
+        return str(pattern)
+
+    def read_until(
+        self,
+        pattern: str,
+        timeout: Optional[int] = None,
+        include_pattern: bool = True,
+    ) -> str:
+        """Read until pattern is found, return everything before it"""
+        self.expect(pattern, timeout)
+        result = self.before if hasattr(self, 'before') else b''
+
+        if include_pattern and hasattr(self, 'after') and self.after:
+            result += self.after
+
+        return result.decode(self.encoding) if isinstance(result, bytes) else result
+    
+    def read_nonblocking(self, size: int = 1024, timeout: float = 0) -> str:
+        """Read available data without blocking"""
+        try:
+            if hasattr(self._transport, 'spawn'):
+                # LiveTransport
+                return self._transport.spawn.read_nonblocking(size, timeout)
+            else:
+                # ReplayTransport - return buffered data
+                return ""
+        except (pexpect.TIMEOUT, AttributeError):
+            return ""
+    
+    def get_recent_output(self, lines: int = 100) -> str:
+        """Get recent output lines"""
+        return "".join(list(self.output_buffer)[-lines:])
+    
+    def get_full_output(self) -> str:
+        """Get all captured output"""
+        return "".join(self.full_output)
+    
+    def is_alive(self) -> bool:
+        """Check if process is still running"""
+        if self._transport:
+            return self._transport.isalive()
+        return False
+
+    def exitstatus(self) -> Optional[int]:
+        """Get exit status if process has ended"""
+        if self._transport:
+            return getattr(self._transport, 'exitstatus', None)
+        return None
+    
+    def close(self, force: bool = False) -> Optional[int]:
+        """Close the session gracefully"""
+        # Stop recorder if active
+        if self._recorder:
+            # Finalize any pending exchange with exit info
+            if not self.is_alive():
+                exit_info = {
+                    'code': self.exitstatus() or 0,
+                    'signal': getattr(self._transport, 'signalstatus', None)
+                }
+                self._recorder.on_expect_complete([], -1, exit_info)
+            self._recorder.stop()
+
+        # Print summary if enabled
+        if self.summary_enabled and self._store:
+            print_summary(self._store)
+
+        if not self._transport:
+            return None
+
+        try:
+            if self.is_alive():
+                self._transport.close(force=force)
+
+            exitstatus = self._transport.exitstatus if hasattr(self._transport, 'exitstatus') else None
+            
+        except Exception as e:
+            logger.error(f"Error closing session: {e}")
+            exitstatus = -1
+            
+        finally:
+            # Stop recorder if active
+            if self._recorder:
+                self._recorder.stop()
+
+            # Print summary if enabled
+            if self.summary_enabled and self._store:
+                print_summary(self._store)
+
+            # Clean up pipe if streaming
+            if self.pipe_fd is not None:
+                self._write_pipe_event("MTX", "session_closed=true")
+                try:
+                    os.close(self.pipe_fd)
+                except OSError:
+                    pass
+                self.pipe_fd = None
+
+            if self._pipe_path and self._pipe_path.exists():
+                try:
+                    self._pipe_path.unlink()
+                except OSError:
+                    pass
+
+            # Remove from registry
+            if self.persist:
+                with _lock:
+                    _sessions.pop(self.session_id, None)
+                    
+        return exitstatus
+    
+    def _determine_and_setup_transport(self, command: str, timeout: int, cwd: Optional[str],
+                                      env: Optional[Dict[str, str]], encoding: str, dimensions: tuple) -> None:
+        """Determine which transport to use based on mode settings"""
+        # Decision matrix for transport selection
+        use_replay = False
+
+        # Simple logic:
+        # - If we're recording (NEW or OVERWRITE), always use live transport
+        # - If recording is DISABLED, use live transport (normal execution)
+        # We would only use replay if there was an explicit replay flag,
+        # but for now we'll always use live transport unless implementing replay mode
+
+        # Always use live transport for now
+        use_replay = False
+
+        if use_replay:
+            self._setup_replay_transport()
+        else:
+            self._setup_live_transport(command, timeout, cwd, env, encoding, dimensions)
+
+    def _setup_replay_transport(self) -> None:
+        """Setup replay transport for tape playback"""
+        # Initialize store
+        self._store = TapeStore(self.tapes_path)
+        self._store.load_all()
+
+        # Create replay transport
+        self._transport = ReplayTransport(
+            store=self._store,
+            matcher=self._matcher_set,
+            fallback_mode=self.fallback_mode,
+            latency_policy=self._latency_policy,
+            error_policy=self._error_policy,
+            program=self.command,
+            args=self.args,
+            env=self.env,
+            cwd=self.cwd,
+            encoding=self.encoding
+        )
+
+        # No self.process in replay mode - everything goes through transport
+
+    def _setup_live_transport(self, command: str, timeout: int, cwd: Optional[str],
+                            env: Optional[Dict[str, str]], encoding: str, dimensions: tuple) -> None:
+        """Setup live transport with optional recording"""
+        try:
+            # Create the real process
+            self.process = pexpect.spawn(
+                command,
+                timeout=timeout,
+                cwd=cwd,
+                env=env,
+                encoding=encoding,
+                dimensions=dimensions,
+                echo=False,
+            )
+
+            # Wrap in live transport
+            self._transport = LiveTransport(self.process)
+
+            # Always set up output capture
+            output_capture = self._OutputCapture(self)
+
+            # Setup recording if enabled
+            if self.record_mode != RecordMode.DISABLED:
+                self._store = TapeStore(self.tapes_path)
+                self._recorder = Recorder(
+                    session=self,
+                    tapes_path=self.tapes_path,
+                    mode=self.record_mode,
+                    namegen=self.tape_name_generator,
+                    store=self._store,
+                    decorators=self._decorators
+                )
+                # Use composite logfile to capture to both output and recorder
+                composite = self._CompositeLogfile(output_capture)
+                self.process.logfile_read = composite
+                self._recorder.start_with_composite(composite)
+            else:
+                # Set up output capture without recording
+                self.process.logfile_read = output_capture
+
+        except Exception as e:
+            raise ProcessError(f"Failed to spawn '{command}': {e}")
+
+    def interact(self) -> None:
+        """
+        Give control to the user for interactive session
+        Useful for debugging
+        """
+        if isinstance(self._transport, ReplayTransport):
+            print("[Interactive mode not available in replay]")
+            return
+
+        print(f"\n[Entering interactive mode for session {self.session_id}]")
+        print("[Press Ctrl+] to exit]")
+
+        try:
+            # Only LiveTransport has a process we can interact with
+            if hasattr(self._transport, 'spawn'):
+                self._transport.spawn.interact()
+            else:
+                print("[Interactive mode not available for this transport type]")
+        except Exception as e:
+            print(f"\n[Exited interactive mode: {e}]")
+    
+    def save_state(self) -> Dict[str, Any]:
+        """Save session state for persistence"""
+        state_dir = Path.home() / ".claude-control" / "sessions" / self.session_id
+        state_dir.mkdir(parents=True, exist_ok=True)
+        
+        state = {
+            "session_id": self.session_id,
+            "command": self.command,
+            "created_at": self.created_at.isoformat(),
+            "last_activity": self.last_activity.isoformat(),
+            "is_alive": self.is_alive(),
+            "pid": self._transport.spawn.pid if hasattr(self._transport, 'spawn') and hasattr(self._transport.spawn, 'pid') else None,
+            "exitstatus": self.exitstatus(),
+            "output_lines": len(self.full_output),
+        }
+        
+        state_file = state_dir / "state.json"
+        state_file.write_text(json.dumps(state, indent=2))
+        
+        return state
+    
+    def save_program_config(self, name: str, include_output: bool = False) -> None:
+        """Save current session as a program configuration
+
+        Args:
+            name: Name for the configuration
+            include_output: Whether to include captured output (default False)
+        """
+        # Extract interaction patterns from session
+        expect_sequences = []
+
+        # Analyze the process interaction history if available
+        if not getattr(self, "expect_history", None):
+            logger.warning(
+                "No expect history recorded for session %s. "
+                "Saved configuration will have an empty expect_sequences list.",
+                self.session_id,
+            )
+        else:
+            step = 1
+            for entry in self.expect_history:
+                matched_pattern = entry.get("matched_pattern")
+                if matched_pattern is None:
+                    continue
+
+                sequence = {
+                    "step": step,
+                    "expect": matched_pattern,
+                }
+
+                patterns = entry.get("patterns") or []
+                matched_index = entry.get("matched_index")
+                if len(patterns) > 1 and matched_index is not None:
+                    readable_patterns = ", ".join(patterns)
+                    sequence["note"] = (
+                        f"Matched option {matched_index + 1} from patterns: {readable_patterns}"
+                    )
+
+                expect_sequences.append(sequence)
+                step += 1
+        
+        notes = [
+            f"Saved from session {self.session_id} on {datetime.now().isoformat()}"
+        ]
+        if not expect_sequences:
+            notes.append("No expect history was recorded during this session.")
+
+        config = {
+            "name": name,
+            "command_template": self.command,
+            "expect_sequences": expect_sequences,
+            "success_indicators": [],
+            "ready_indicators": [],
+            "typical_timeout": self.timeout,
+            "notes": " ".join(notes),
+        }
+        
+        if include_output:
+            # Add sample output for reference (first 100 lines)
+            output_lines = self.full_output[:100]
+            config["sample_output"] = output_lines
+        
+        # Save configuration
+        config_dir = Path.home() / ".claude-control" / "programs"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        
+        config_path = config_dir / f"{name}.json"
+        config_path.write_text(json.dumps(config, indent=2))
+        
+        logger.info(f"Saved program configuration '{name}'")
+    
+    def apply_config(self, name: str) -> None:
+        """Apply a saved configuration to current session
+        
+        Args:
+            name: Name of the configuration to apply
+        """
+        config = get_config(name)
+        
+        # Apply timeout if not explicitly set
+        if hasattr(self, '_original_timeout') and self.timeout == self._original_timeout:
+            self.timeout = config.get("typical_timeout", self.timeout)
+        
+        # Store configuration for reference
+        self._applied_config = config
+        
+        logger.info(f"Applied configuration '{name}' to session")
+    
+    @classmethod
+    def from_config(cls, name: str, **kwargs) -> 'Session':
+        """Create a new session from a saved configuration
+        
+        Args:
+            name: Name of the configuration to use
+            **kwargs: Additional parameters to override config
+            
+        Returns:
+            New Session instance
+        """
+        config = get_config(name)
+        
+        # Extract session parameters from config
+        command = kwargs.get('command', config.get('command_template', ''))
+        timeout = kwargs.get('timeout', config.get('typical_timeout', 30))
+        
+        # Create session
+        session = cls(
+            command=command,
+            timeout=timeout,
+            **{k: v for k, v in kwargs.items() if k not in ['command', 'timeout']}
+        )
+        
+        # Store config reference
+        session._applied_config = config
+        session._config_name = name
+        
+        return session
+    
+    @property
+    def pipe_path(self) -> Optional[Path]:
+        """Get the path to the named pipe if streaming is enabled"""
+        return self._pipe_path
+    
+    def _setup_pipe_stream(self):
+        """Set up named pipe for streaming"""
+        pipe_dir = Path("/tmp/claudecontrol")
+        pipe_dir.mkdir(exist_ok=True, mode=0o700)
+        
+        self._pipe_path = pipe_dir / f"{self.session_id}.pipe"
+        
+        # Remove existing pipe if present
+        if self._pipe_path.exists():
+            try:
+                self._pipe_path.unlink()
+            except OSError:
+                pass
+        
+        try:
+            # Create named pipe
+            os.mkfifo(self._pipe_path, mode=0o600)
+            
+            # Open pipe for writing with non-blocking mode
+            # Use O_RDWR to avoid blocking when no reader is present
+            self.pipe_fd = os.open(str(self._pipe_path), os.O_RDWR | os.O_NONBLOCK)
+            
+            # Write initial metadata
+            self._write_pipe_event("MTX", f"session_id={self.session_id}")
+            self._write_pipe_event("MTX", f"command={self.command}")
+            
+        except Exception as e:
+            # Failed to create pipe - continue without streaming
+            logger.debug(f"Failed to create pipe: {e}")
+            self._pipe_path = None
+            self.pipe_fd = None
+    
+    def _write_pipe_event(self, event_type: str, data: str):
+        """Write an event to the pipe if streaming is enabled"""
+        if self.pipe_fd is None:
+            return
+        
+        try:
+            timestamp = f"{time.time():.3f}"
+            event = f"[{timestamp}][{event_type}] {data}\n"
+            os.write(self.pipe_fd, event.encode(self.encoding))
+        except (BlockingIOError, OSError):
+            # No readers or pipe closed - ignore
+            pass
+    
+    def __enter__(self):
+        """Context manager support"""
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Cleanup on context exit"""
+        if not self.persist:
+            self.close()
+        # Print summary if enabled
+        if self.summary_enabled and self._store:
+            print_summary(self._store)
+            
+    def __repr__(self):
+        return (
+            f"Session(id={self.session_id}, "
+            f"command={self.command!r}, alive={self.is_alive()})"
+        )
+
+
+# High-level convenience functions
+
+def control(
+    command: str,
+    timeout: int = 30,
+    cwd: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+    session_id: Optional[str] = None,
+    reuse: bool = True,
+    with_config: Optional[str] = None,
+    stream: bool = False,
+) -> Session:
+    """
+    Take control of a process or reuse existing one
+    
+    Args:
+        command: Command to execute
+        timeout: Default timeout for operations
+        cwd: Working directory
+        env: Environment variables
+        session_id: Explicit session ID (auto-generated if not provided)
+        reuse: If True, reuse existing session with same command
+        with_config: Name of configuration to apply
+        stream: If True, enable named pipe streaming
+        
+    Returns:
+        Session instance
+    """
+    # Check for reusable session
+    if reuse and not session_id:
+        with _lock:
+            for sid, session in _sessions.items():
+                if session.command == command and session.is_alive():
+                    logger.debug(f"Reusing session {sid} for command: {command}")
+                    return session
+    
+    # Check for existing session by ID
+    if session_id and session_id in _sessions:
+        session = _sessions[session_id]
+        if session.is_alive():
+            return session
+        else:
+            # Clean up dead session
+            session.close()
+    
+    # Create new session
+    if with_config:
+        # Use configuration
+        session = Session.from_config(
+            with_config,
+            command=command,
+            timeout=timeout,
+            cwd=cwd,
+            env=env,
+            session_id=session_id,
+            stream=stream,
+        )
+    else:
+        session = Session(
+            command=command,
+            timeout=timeout,
+            cwd=cwd,
+            env=env,
+            session_id=session_id,
+            stream=stream,
+        )
+    
+    return session
+
+
+def run(
+    command: str,
+    expect: Optional[Union[str, List[str]]] = None,
+    send: Optional[str] = None,
+    timeout: int = 30,
+    cwd: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> str:
+    """
+    One-liner to run a controlled command.
+    If the command does not finish before ``timeout`` when no ``expect`` pattern
+    is provided, the process is terminated and a :class:`TimeoutError` is
+    raised.
+    
+    Args:
+        command: Command to run
+        expect: Pattern(s) to wait for
+        send: Input to send after expect
+        timeout: Operation timeout. When no ``expect`` pattern is provided and
+            the process does not complete before this timeout, a
+            :class:`TimeoutError` is raised and the process is terminated.
+        cwd: Working directory
+        env: Environment variables
+        
+    Returns:
+        Captured output
+        
+    Example:
+        output = run("npm test", expect="All tests passed")
+    """
+    with Session(command, timeout=timeout, cwd=cwd, env=env, persist=False) as session:
+
+        exit_status = None
+        signal_status = None
+
+        if expect:
+            session.expect(expect, timeout=timeout)
+
+        if send:
+            session.send(send)
+            # Wait a bit for response
+            time.sleep(0.5)
+
+        # Wait for process to complete if no expect pattern given
+        if not expect:
+            try:
+                session.expect(pexpect.EOF, timeout=timeout)
+                exit_status = session.exitstatus()
+                if session.process is not None:
+                    signal_status = session.process.signalstatus
+                    if exit_status is None:
+                        try:
+                            session.process.wait()
+                        except (pexpect.exceptions.ExceptionPexpect, OSError):
+                            pass
+                        else:
+                            exit_status = session.exitstatus()
+                            signal_status = session.process.signalstatus
+            except TimeoutError:
+                logger.warning(
+                    f"Command '{command}' exceeded timeout of {timeout}s; terminating"
+                )
+                session.close()
+                raise
+
+        # Get all output
+        output = session.get_full_output()
+
+        if exit_status not in (None, 0) or signal_status not in (None, 0):
+            status_parts = []
+            if exit_status not in (None, 0):
+                status_parts.append(f"exit status {exit_status}")
+            if signal_status not in (None, 0):
+                status_parts.append(f"signal {signal_status}")
+            status_desc = " and ".join(status_parts) if status_parts else "an unknown error"
+            raise ProcessError(
+                f"Command '{command}' failed with {status_desc}.\nOutput:\n{output}"
+            )
+
+        # If process is still running, terminate it
+        if session.is_alive():
+            session.close()
+
+    return output
+
+
+def get_session(session_id: str) -> Optional[Session]:
+    """Get existing session by ID"""
+    with _lock:
+        return _sessions.get(session_id)
+
+
+def list_sessions(active_only: bool = False) -> List[Dict[str, Any]]:
+    """
+    List all sessions
+
+    Args:
+        active_only: If True, only return alive sessions. Defaults to False so
+            completed sessions remain visible until cleanup.
+        
+    Returns:
+        List of session info dicts
+    """
+    sessions = []
+    
+    with _lock:
+        for session in _sessions.values():
+            if active_only and not session.is_alive():
+                continue
+                
+            sessions.append({
+                "session_id": session.session_id,
+                "command": session.command,
+                "is_alive": session.is_alive(),
+                "created_at": session.created_at.isoformat(),
+                "last_activity": session.last_activity.isoformat(),
+                "pid": session.process.pid if session.process else None,
+            })
+            
+    return sessions
+
+
+def cleanup_zombies():
+    """Clean up any zombie processes"""
+    try:
+        current_process = psutil.Process()
+        children = current_process.children(recursive=True)
+        
+        for child in children:
+            try:
+                if child.status() == psutil.STATUS_ZOMBIE:
+                    child.terminate()
+                    child.wait(timeout=1)
+            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                pass
+                
+    except Exception as e:
+        logger.error(f"Error cleaning zombies: {e}")
+
+
+def cleanup_sessions(force: bool = False, max_age_minutes: int = 60) -> int:
+    """
+    Clean up dead or old sessions
+    
+    Args:
+        force: Force close all sessions
+        max_age_minutes: Close sessions older than this
+        
+    Returns:
+        Number of sessions cleaned up
+    """
+    cleanup_zombies()  # Clean up zombies first
+    
+    cleaned = 0
+    cutoff_time = datetime.now() - timedelta(minutes=max_age_minutes)
+
+    # Collect sessions to clean while holding the lock
+    with _lock:
+        sessions_to_clean = [
+            session
+            for session in _sessions.values()
+            if (
+                force
+                or not session.is_alive()
+                or session.last_activity < cutoff_time
+            )
+        ]
+
+    # Close sessions outside of the lock to avoid deadlocks
+    for session in sessions_to_clean:
+        session.close()
+        cleaned += 1
+                
+    logger.info(f"Cleaned up {cleaned} sessions")
+    return cleaned
+
+
+# Configuration management functions
+
+def list_configs() -> List[str]:
+    """List all saved program configurations"""
+    config_dir = Path.home() / ".claude-control" / "programs"
+    if not config_dir.exists():
+        return []
+    
+    configs = []
+    for config_file in config_dir.glob("*.json"):
+        configs.append(config_file.stem)
+    
+    return sorted(configs)
+
+
+def delete_config(name: str) -> None:
+    """Delete a program configuration"""
+    config_path = Path.home() / ".claude-control" / "programs" / f"{name}.json"
+    if not config_path.exists():
+        raise ConfigNotFoundError(f"Configuration '{name}' not found")
+    
+    config_path.unlink()
+    logger.info(f"Deleted configuration '{name}'")
+
+
+def get_config(name: str) -> dict:
+    """Get a program configuration as dict"""
+    config_path = Path.home() / ".claude-control" / "programs" / f"{name}.json"
+    if not config_path.exists():
+        raise ConfigNotFoundError(f"Configuration '{name}' not found")
+    
+    try:
+        return json.loads(config_path.read_text())
+    except Exception as e:
+        raise ConfigNotFoundError(f"Error reading configuration '{name}': {e}")
+
+
+# Auto-cleanup on exit
+@atexit.register 
+def _cleanup_on_exit():
+    """Clean up sessions on program exit"""
+    config = _load_config()
+    if config.get("auto_cleanup", True):
+        cleanup_sessions(force=True)
+
+
+# File-based interface for Claude Code
+
+class FileInterface:
+    """
+    File-based communication for Claude Code
+    This is optional - direct usage is preferred
+    """
+    
+    def __init__(self, base_dir: Optional[Path] = None):
+        self.base_dir = base_dir or Path.home() / ".claude-control"
+        self.commands_dir = self.base_dir / "commands"
+        self.responses_dir = self.base_dir / "responses"
+        
+        # Ensure directories exist
+        self.commands_dir.mkdir(parents=True, exist_ok=True)
+        self.responses_dir.mkdir(parents=True, exist_ok=True)
+    
+    def process_commands(self, timeout: float = 0.1):
+        """Process any pending command files with file locking"""
+        for cmd_file in self.commands_dir.glob("*.json"):
+            try:
+                # Try to acquire exclusive lock
+                with open(cmd_file, 'r') as f:
+                    try:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except IOError:
+                        # Another process has the lock, skip this file
+                        continue
+                    
+                    # Read command
+                    cmd_data = json.loads(f.read())
+                
+                # Process it (file is now closed and unlocked)
+                response = self._process_command(cmd_data)
+                
+                # Write response
+                resp_file = self.responses_dir / f"resp_{cmd_file.stem}.json"
+                resp_file.write_text(json.dumps(response, indent=2))
+                
+                # Clean up command file
+                cmd_file.unlink()
+                
+            except Exception as e:
+                logger.error(f"Error processing command {cmd_file}: {e}")
+    
+    def _process_command(self, cmd: dict) -> dict:
+        """Process a single command"""
+        cmd_type = cmd.get("command")
+        
+        try:
+            if cmd_type == "spawn":
+                session = control(**cmd.get("parameters", {}))
+                return {
+                    "status": "success",
+                    "session_id": session.session_id,
+                    "pid": session.process.pid,
+                }
+                
+            elif cmd_type == "send":
+                session = get_session(cmd["session_id"])
+                if not session:
+                    raise SessionError(f"Session not found: {cmd['session_id']}")
+                session.send(cmd["text"])
+                return {"status": "success"}
+                
+            elif cmd_type == "expect":
+                session = get_session(cmd["session_id"])
+                if not session:
+                    raise SessionError(f"Session not found: {cmd['session_id']}")
+                index = session.expect(cmd["patterns"], cmd.get("timeout"))
+                return {
+                    "status": "success",
+                    "index": index,
+                    "before": session.process.before,
+                    "after": session.process.after,
+                }
+                
+            elif cmd_type == "close":
+                session = get_session(cmd["session_id"])
+                if session:
+                    session.close()
+                return {"status": "success"}
+                
+            elif cmd_type == "list":
+                return {
+                    "status": "success",
+                    "sessions": list_sessions(),
+                }
+                
+            else:
+                raise ValueError(f"Unknown command: {cmd_type}")
+                
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": str(e),
+                "type": type(e).__name__,
+            }
