@@ -80,7 +80,7 @@ graph TD
     ROUTER -->|probe cmd| PROBE
     ROUTER -->|chain cmd| CHAIN
     
-    %invaded Discovery Flow
+    %%invaded Discovery Flow
     INVESTIGATE -->|spawn| SPAWN
     PROBE -->|spawn| SPAWN
     STATE_MAP -->|spawn| SPAWN
