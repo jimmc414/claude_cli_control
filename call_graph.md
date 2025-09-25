@@ -182,7 +182,7 @@ graph TD
 ```mermaid
 graph TD
     subgraph "Session Creation"
-        control_func[control()]
+        control_func[control]
         find[find_session]
         new[Session.__init__]
         spawn[pexpect.spawn]
